@@ -1,0 +1,451 @@
+// ============================================================
+// Clothing Store Management System — Database Schema
+// ============================================================
+// Design notes:
+// - Stock is NEVER written directly on ProductVariant by app code.
+//   It is only ever mutated inside InventoryTransaction-creating
+//   service functions (purchase, sale, return, damage, adjustment),
+//   inside a DB transaction, so the running `stock` field and the
+//   `InventoryTransaction` ledger can never drift apart.
+// - Money fields use Decimal(12,2) to avoid floating point drift.
+// ============================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ------------------------------------------------------------
+// Auth / Users
+// ------------------------------------------------------------
+
+enum Role {
+  OWNER
+  MANAGER
+  CASHIER
+}
+
+model User {
+  id           String   @id @default(cuid())
+  name         String
+  email        String   @unique
+  passwordHash String
+  role         Role     @default(CASHIER)
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  sales             Sale[]
+  purchases         Purchase[]
+  activityLogs      ActivityLog[]
+  inventoryTx       InventoryTransaction[]
+
+  @@map("users")
+}
+
+// ------------------------------------------------------------
+// Catalog
+// ------------------------------------------------------------
+
+model Category {
+  id        String    @id @default(cuid())
+  name      String    @unique
+  isActive  Boolean   @default(true)
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  products  Product[]
+
+  @@map("categories")
+}
+
+model Brand {
+  id        String    @id @default(cuid())
+  name      String    @unique
+  isActive  Boolean   @default(true)
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  products  Product[]
+
+  @@map("brands")
+}
+
+enum ProductStatus {
+  ACTIVE
+  INACTIVE
+  DISCONTINUED
+}
+
+model Product {
+  id          String        @id @default(cuid())
+  name        String
+  sku         String        @unique
+  barcode     String?       @unique
+  description String?
+  costPrice   Decimal       @default(0) @db.Decimal(12, 2)
+  sellPrice   Decimal       @default(0) @db.Decimal(12, 2)
+  images      String[]      @default([])
+  status      ProductStatus @default(ACTIVE)
+
+  categoryId String?
+  category   Category? @relation(fields: [categoryId], references: [id])
+
+  brandId String?
+  brand   Brand?  @relation(fields: [brandId], references: [id])
+
+  variants ProductVariant[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([name])
+  @@index([categoryId])
+  @@index([brandId])
+  @@map("products")
+}
+
+enum Size {
+  XS
+  S
+  M
+  L
+  XL
+  XXL
+}
+
+enum StockStatus {
+  IN_STOCK
+  LOW_STOCK
+  OUT_OF_STOCK
+}
+
+model ProductVariant {
+  id      String  @id @default(cuid())
+  size    Size
+  color   String
+  sku     String  @unique
+  barcode String  @unique
+
+  // Running stock — mutated only via InventoryTransaction service calls.
+  stock Int @default(0)
+
+  // Denormalized status, recomputed and persisted in the same atomic write
+  // as `stock` (see inventoryService.applyInventoryChange). Storing this
+  // instead of computing it per-request at read time is what makes
+  // low-stock/out-of-stock filtering correct AND indexed at the DB level.
+  stockStatus StockStatus @default(OUT_OF_STOCK)
+
+  // Optional per-variant price override; falls back to Product.sellPrice when null.
+  price Decimal? @db.Decimal(12, 2)
+
+  lowStockThreshold Int @default(5)
+
+  productId String
+  product   Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  purchaseItems       PurchaseItem[]
+  saleItems           SaleItem[]
+  returnItems         ReturnItem[]
+  inventoryTx         InventoryTransaction[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([productId, size, color])
+  @@index([barcode])
+  @@index([stockStatus])
+  @@map("product_variants")
+}
+
+// ------------------------------------------------------------
+// Suppliers
+// ------------------------------------------------------------
+
+model Supplier {
+  id        String     @id @default(cuid())
+  company   String
+  contact   String?
+  phone     String?
+  gst       String?
+  email     String?
+  address   String?
+  isActive  Boolean    @default(true)
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
+  purchases Purchase[]
+
+  @@map("suppliers")
+}
+
+// ------------------------------------------------------------
+// Customers
+// ------------------------------------------------------------
+
+model Customer {
+  id        String   @id @default(cuid())
+  name      String
+  phone     String?  @unique
+  email     String?
+  notes     String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  sales Sale[]
+
+  @@map("customers")
+}
+
+// ------------------------------------------------------------
+// Purchases (stock IN)
+// ------------------------------------------------------------
+// Note on delete behavior: PurchaseItem/SaleItem/ReturnItem below all
+// reference ProductVariant with NO explicit onDelete, which defaults to
+// RESTRICT in Postgres. This is intentional: a variant that has ever been
+// purchased, sold, or returned can never be hard-deleted out from under
+// its own history. Do not change this to Cascade — that would silently
+// destroy sales/purchase records instead of just refusing the delete.
+
+model Purchase {
+  id            String   @id @default(cuid())
+  invoiceNumber String   @unique
+  date          DateTime @default(now())
+  notes         String?
+
+  supplierId String
+  supplier   Supplier @relation(fields: [supplierId], references: [id])
+
+  createdById String
+  createdBy   User   @relation(fields: [createdById], references: [id])
+
+  items PurchaseItem[]
+
+  totalAmount Decimal @default(0) @db.Decimal(12, 2)
+
+  createdAt DateTime @default(now())
+
+  @@index([date])
+  @@index([supplierId])
+  @@index([createdById])
+  @@map("purchases")
+}
+
+model PurchaseItem {
+  id         String   @id @default(cuid())
+  purchaseId String
+  purchase   Purchase @relation(fields: [purchaseId], references: [id], onDelete: Cascade)
+
+  variantId String
+  variant   ProductVariant @relation(fields: [variantId], references: [id])
+
+  quantity      Int
+  purchasePrice Decimal @db.Decimal(12, 2)
+
+  @@index([purchaseId])
+  @@index([variantId])
+  @@map("purchase_items")
+}
+
+// ------------------------------------------------------------
+// Sales / POS (stock OUT)
+// ------------------------------------------------------------
+
+enum PaymentMethod {
+  CASH
+  UPI
+  CARD
+  MIXED
+}
+
+enum SaleStatus {
+  COMPLETED
+  RETURNED
+  PARTIALLY_RETURNED
+  VOID
+}
+
+model Sale {
+  id            String     @id @default(cuid())
+  invoiceNumber String     @unique
+  status        SaleStatus @default(COMPLETED)
+
+  // Client-generated idempotency key (one per cart/checkout attempt). If a
+  // request arrives with a clientRef that already exists, the existing sale
+  // is returned instead of creating a duplicate — protects against
+  // double-clicks and network retries re-submitting the same cart.
+  clientRef String? @unique
+
+  customerId String?
+  customer   Customer? @relation(fields: [customerId], references: [id])
+
+  cashierId String
+  cashier   User   @relation(fields: [cashierId], references: [id])
+
+  items    SaleItem[]
+  payments Payment[]
+  returns  Return[]
+
+  subtotal       Decimal @db.Decimal(12, 2)
+  discountAmount Decimal @default(0) @db.Decimal(12, 2)
+  taxAmount      Decimal @default(0) @db.Decimal(12, 2)
+  totalAmount    Decimal @db.Decimal(12, 2)
+
+  discountType  String? // FLAT | PERCENTAGE | COUPON
+  discountValue Decimal? @db.Decimal(12, 2)
+  couponCode    String?
+
+  createdAt DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([customerId])
+  @@index([cashierId])
+  @@map("sales")
+}
+
+model SaleItem {
+  id     String @id @default(cuid())
+  saleId String
+  sale   Sale   @relation(fields: [saleId], references: [id], onDelete: Cascade)
+
+  variantId String
+  variant   ProductVariant @relation(fields: [variantId], references: [id])
+
+  quantity  Int
+  unitPrice Decimal @db.Decimal(12, 2)
+  lineTotal Decimal @db.Decimal(12, 2)
+
+  @@index([saleId])
+  @@index([variantId])
+  @@map("sale_items")
+}
+
+model Payment {
+  id     String        @id @default(cuid())
+  saleId String
+  sale   Sale          @relation(fields: [saleId], references: [id], onDelete: Cascade)
+  method PaymentMethod
+  amount Decimal       @db.Decimal(12, 2)
+
+  createdAt DateTime @default(now())
+
+  @@map("payments")
+}
+
+// ------------------------------------------------------------
+// Returns / Exchanges
+// ------------------------------------------------------------
+
+enum ReturnType {
+  RETURN
+  EXCHANGE
+}
+
+model Return {
+  id     String     @id @default(cuid())
+  saleId String
+  sale   Sale       @relation(fields: [saleId], references: [id])
+  type   ReturnType
+  reason String?
+
+  items ReturnItem[]
+
+  createdAt DateTime @default(now())
+
+  @@index([saleId])
+  @@map("returns")
+}
+
+model ReturnItem {
+  id       String @id @default(cuid())
+  returnId String
+  return   Return @relation(fields: [returnId], references: [id], onDelete: Cascade)
+
+  variantId String
+  variant   ProductVariant @relation(fields: [variantId], references: [id])
+
+  quantity     Int
+  refundAmount Decimal @db.Decimal(12, 2)
+
+  @@index([returnId])
+  @@index([variantId])
+  @@map("return_items")
+}
+
+// ------------------------------------------------------------
+// Inventory ledger — the single source of truth for stock movement
+// ------------------------------------------------------------
+
+enum InventoryTxType {
+  PURCHASE
+  SALE
+  RETURN
+  DAMAGE
+  ADJUSTMENT
+}
+
+model InventoryTransaction {
+  id     String          @id @default(cuid())
+  type   InventoryTxType
+  change Int // positive or negative delta applied to variant.stock
+  reason String?
+
+  variantId String
+  variant   ProductVariant @relation(fields: [variantId], references: [id])
+
+  referenceType String? // "PURCHASE" | "SALE" | "RETURN" | "MANUAL"
+  referenceId   String? // id of the purchase/sale/return that caused this
+
+  createdById String?
+  createdBy   User?   @relation(fields: [createdById], references: [id])
+
+  createdAt DateTime @default(now())
+
+  @@index([variantId, createdAt])
+  @@map("inventory_transactions")
+}
+
+// ------------------------------------------------------------
+// Store Settings — single-row table (this is a single-store system)
+// ------------------------------------------------------------
+
+model StoreSettings {
+  id String @id @default("store_settings")
+
+  storeName    String  @default("My Clothing Store")
+  address      String?
+  phone        String?
+  email        String?
+  gstNumber    String?
+  invoicePrefix String @default("INV")
+  defaultTaxRate Decimal @default(5) @db.Decimal(5, 2) // percent, e.g. 5.00
+  currencyCode String  @default("INR")
+  receiptFooter String? @default("Thank you for shopping with us!")
+  lowStockThresholdDefault Int @default(5)
+
+  updatedAt DateTime @updatedAt
+
+  @@map("store_settings")
+}
+
+// ------------------------------------------------------------
+// Activity Logs
+// ------------------------------------------------------------
+
+model ActivityLog {
+  id     String @id @default(cuid())
+  action String // e.g. "PRODUCT_CREATED", "SALE_CREATED", "LOGIN"
+  entity String? // e.g. "Product", "Sale"
+  entityId String?
+  details Json?
+
+  userId String?
+  user   User?  @relation(fields: [userId], references: [id])
+
+  createdAt DateTime @default(now())
+
+  @@index([entity, entityId])
+  @@index([userId])
+  @@map("activity_logs")
+}
